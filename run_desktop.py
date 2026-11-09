@@ -3,7 +3,18 @@ import os
 import time
 import threading
 import webbrowser
-from streamlit.web import cli as stcli
+try:
+    from streamlit.web import cli as stcli
+except ImportError:
+    from streamlit import cli as stcli
+if __name__ == "__main__":
+    sys.argv = [
+        "streamlit",
+        "run",
+        os.path.join(os.path.dirname(__file__), "app.py"),
+        "--global.developmentMode=false"
+    ]
+    sys.exit(stcli.main())
 
 def run_server():
     # Resolve the absolute path of app.py whether running as script or frozen exe

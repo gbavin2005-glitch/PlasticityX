@@ -102,3 +102,92 @@ def score_plasticity(df_expr: pd.DataFrame, sigma: float = 1.0, lambda_entropy: 
     drug_df = pd.DataFrame(drug_predictions, index=samples)
     z_df = pd.DataFrame(z_matrix, index=genes, columns=samples)
     return results_df, drug_df, z_df
+# =====================================================================
+# 1. AUTOMATED MARKER FALLBACK & IMPUTATION ENGINE
+# =====================================================================
+PROXY_GENE_NETWORK = {
+    # Epithelial axis fallbacks
+    "CDH1": ["EPCAM", "KRT19", "KRT18", "CDH3", "OCLN"],
+    "EPCAM": ["CDH1", "KRT19", "KRT8", "CLDN4"],
+    "KRT19": ["KRT18", "KRT8", "EPCAM", "CDH1"],
+    "OCLN": ["CLDN4", "CDH1", "DSP"],
+    
+    # Mesenchymal axis fallbacks
+    "VIM": ["FN1", "CDH2", "ZEB1", "SNAI2"],
+    "CDH2": ["VIM", "FN1", "TWIST1", "ZEB2"],
+    "FN1": ["VIM", "COL1A1", "COL1A2", "MMP2"],
+    "ZEB1": ["ZEB2", "SNAI1", "TWIST1"],
+    
+    # Stemness axis fallbacks
+    "CD44": ["PROM1", "ALDH1A1", "SOX2", "NANOG"],
+    "CD24": ["EPCAM", "PROM1", "POU5F1"],
+    "PROM1": ["CD44", "ALDH1A1", "SOX2"],
+    
+    # Stromal / Microenvironment fallbacks
+    "FAP": ["ACTA2", "COL1A1", "PDGFRB", "SPARC"],
+    "ACTA2": ["TAGLN", "MYH11", "COL1A1", "FAP"],
+    "COL1A1": ["COL1A2", "COL3A1", "FN1", "FAP"]
+}
+
+def impute_missing_hallmarks(df: pd.DataFrame, target_genes: list) -> tuple[pd.DataFrame, dict]:
+    """
+    Scans the expression matrix for missing hallmark genes and imputes them
+    using co-expression biological proxy networks or median signature baseline.
+    """
+    imputed_df = df.copy()
+    available_genes = set(imputed_df.index)
+    imputation_log = {}
+
+    for gene in target_genes:
+        if gene not in available_genes:
+            proxies = PROXY_GENE_NETWORK.get(gene, [])
+            found_proxies = [p for p in proxies if p in available_genes]
+            
+            if found_proxies:
+                imputed_df.loc[gene] = imputed_df.loc[found_proxies].mean(axis=0)
+                imputation_log[gene] = f"Imputed via proxy network: ({', '.join(found_proxies)})"
+            else:
+                # Fallback to normalized cohort-wide baseline median
+                imputed_df.loc[gene] = imputed_df.median(axis=0)
+                imputation_log[gene] = "Imputed via cohort transcriptomic median baseline"
+
+    return imputed_df, imputation_log
+
+
+# =====================================================================
+# 2. DYNAMIC PURITY-AWARE MICROENVIRONMENT DECONVOLUTION
+# =====================================================================
+def estimate_tumor_purity_deconvolution(df: pd.DataFrame) -> tuple[pd.Series, float, dict]:
+    """
+    Reference-free transcriptomic deconvolution calculating cellular purity
+    and dynamically deriving the optimal alpha-stromal penalty factor.
+    """
+    stromal_markers = ["FAP", "ACTA2", "COL1A1", "COL3A1", "PDGFRB"]
+    found_stromal = [g for g in stromal_markers if g in df.index]
+
+    if not found_stromal:
+        purity_scores = pd.Series(1.0, index=df.columns)
+        return purity_scores, 0.50, {"status": "No stromal markers detected; set to neutral"}
+
+    # Aggregate stromal burden across all cells/patients
+    stromal_expression = df.loc[found_stromal].mean(axis=0)
+    s_min = stromal_expression.min()
+    s_max = stromal_expression.max()
+    
+    # Min-max normalization
+    norm_stromal = (stromal_expression - s_min) / (s_max - s_min + 1e-8)
+    
+    # Estimate tumor purity (inverse to stromal density)
+    purity_scores = 1.0 - (0.70 * norm_stromal)
+    
+    # Dynamically derive alpha-stromal penalty based on cohort burden
+    cohort_mean_stroma = float(norm_stromal.mean())
+    recommended_alpha = round(min(0.95, max(0.20, 0.35 + (0.60 * cohort_mean_stroma))), 2)
+
+    metrics = {
+        "markers_used": found_stromal,
+        "mean_purity": round(float(purity_scores.mean()), 3),
+        "recommended_alpha": recommended_alpha
+    }
+
+    return purity_scores, recommended_alpha, metrics
